@@ -1,0 +1,6 @@
+[package]
+name = "ternary-harbor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Harbor pattern for agent docking and resource management in ternary fleets"
