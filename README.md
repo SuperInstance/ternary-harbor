@@ -79,6 +79,19 @@ Harbors manage agent lifecycle at **SuperInstance** room boundaries. Each room h
 - Brewer, Eric. "CAP Twelve Years Later," *IEEE Computer*, 45(2), 2012 — fault tolerance.
 - Kleinberg, Jon & Tardos, Éva. *Algorithm Design*, Pearson, 2006 — scheduling algorithms.
 
+
+
+## Complexity Summary
+
+| Operation | Time | Notes |
+|---|---|---|
+| Dock assignment | O(d) for d docks | Linear scan for empty berth |
+| Pilot assignment | O(p) for p pilots | Find free pilot |
+| Breakwater check | O(1) per agent | Threshold comparison |
+| Priority scheduling | O(a log a) for a agents | Heap-based selection |
+
+The harbor scales linearly with berth count. Breakwater monitoring adds O(1) overhead per agent per tick, enabling real-time fault detection at fleet scale.
+
 ## License
 
 MIT
