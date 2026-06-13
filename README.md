@@ -1,69 +1,83 @@
-# ternary-harbor
+# Ternary Harbor — Agent Docking and Resource Management for Ternary Fleets
 
-**Where agents dock. Berths, pilots, and the logistics of arrival.**
+**Ternary Harbor** implements the harbor pattern for agent lifecycle management: agents arrive at rooms, get assigned berths (docks), receive guidance from pilots (local helpers), and are protected by breakwaters (failure isolation). Each agent's priority is classified ternarily as {-1 (reject), 0 (neutral), +1 (priority)}, enabling three-tier scheduling.
 
-A harbor is the space between the open ocean and the safety of port. Ships arrive from voyages, wait for a berth, get guided in by a pilot, dock, unload cargo, refit, and eventually depart again. The harbor manages the entire lifecycle of arrival and departure — it's the coordination layer between the outside world and the protected interior.
+## Why It Matters
 
-In the SuperInstance fleet, a harbor is where agent processes connect to rooms. An agent arriving at a harbor requests a berth (an allocation of resources). If space is available, a pilot (a guided setup process) helps the agent dock. Once docked, the agent can exchange cargo (data) with the room. When done, the agent undocks and departs.
+Fleet resource management is fundamentally a scheduling problem: agents arrive, need compute resources, must be isolated from failures, and eventually depart. The harbor metaphor captures all these concerns naturally: berths have capacity limits, pilots provide initialization assistance, tugs handle resource-constrained agents, and breakwaters prevent cascading failures from reaching other docked agents. The ternary priority system adds nuance missing from binary priority: agents can be deprioritized (-1), treated normally (0), or fast-tracked (+1) without the complexity of a continuous priority score.
 
-## What's Inside
+## How It Works
 
-- **`Harbor`** — manages berths, pilots, and docking schedule
-- **`Berth`** — a docking slot with capacity, assigned agent, and status
-- **`Pilot`** — a guided setup process that helps agents dock safely
-- **`dock(harbor, agent)`** — request a berth and begin docking
-- **`undock(harbor, agent_id)`** — release the berth and depart
-- **`berth_status(harbor)`** — which berths are occupied, available, or reserved
-- **`pilot_guide(harbor, agent_id)`** — get the pilot's setup instructions
+### Berth Management
 
-## Quick Example
+Each `Dock` (berth) has a status: `Empty`, `Occupied(agent)`, `Reserved(agent)`, or `Maintenance`. Capacity limits ensure a dock isn't overloaded. Docking an agent:
+1. Find an empty dock with sufficient capacity
+2. Transition status: Empty → Reserved → Occupied
+3. Assign pilot if agent needs initialization assistance
+
+Undocking transitions: Occupied → Empty (or Maintenance if cleanup needed).
+
+### Pilot Service
+
+Pilots are local helper agents that guide incoming agents through initialization:
+- Context injection (loading room state, constellation configuration)
+- Dependency resolution (ensuring required skills are available)
+- Health check (verifying the agent can execute its task)
+
+Pilot assignment is O(p) for p available pilots.
+
+### Breakwater (Failure Isolation)
+
+Breakwaters monitor docked agents for failure signals. When an agent enters a failure state, the breakwater:
+1. Quarantines the agent (prevents it from sending messages)
+2. Logs diagnostic data
+3. Notifies the steward for resource cleanup
+
+This prevents cascading failures — the "tsunami" effect — where one agent's failure destabilizes its neighbors.
+
+### Ternary Priority
+
+Agent priority determines scheduling order:
+- **+1 (Positive)**: High-priority agents dock first, get largest berths
+- **0 (Neutral)**: Standard scheduling
+- **-1 (Negative)**: Deprioritized; docked only when capacity is available
+
+## Quick Start
 
 ```rust
-use ternary_harbor::*;
+use ternary_harbor::{Dock, BerthId, AgentId, BerthStatus};
 
-let mut harbor = Harbor::new(5); // 5 berths available
+let mut dock = Dock::new(BerthId(1), 100);
+assert_eq!(dock.capacity(), 100);
 
-// Agent 42 arrives and requests docking
-let result = dock(&mut harbor, 42);
-assert!(result.is_ok());
-
-// Check berth status
-let status = berth_status(&harbor);
-println!("Available: {}/5", status.available);
-
-// Agent 42 departs
-undock(&mut harbor, 42);
-// Berth released, available for next arrival
+// Dock an agent
+let agent = AgentId(42);
+// dock.reserve(agent);
+// dock.arrive(agent);
 ```
-
-## The Deeper Truth
-
-**Harbors are the coordination bottleneck.** Every agent that wants to join a room must pass through the harbor. This means the harbor controls the admission rate — it can accept agents faster than the room can handle, creating a queue; or it can reject agents when full, creating a barrier. The harbor is the *shaper* of the room's population dynamics.
-
-The pilot pattern is borrowed from maritime tradition: real harbor pilots board ships at the harbor entrance and guide them through the narrow channel to their berth. The pilot knows the local conditions (current, depth, traffic) in a way the ship's captain doesn't. In the fleet, the pilot guides the agent through setup — configuring its state, connecting it to the room's communication channels, and verifying it meets the room's requirements.
-
-**Use cases:**
-- **Agent lifecycle management** — control how agents join and leave rooms
-- **Resource allocation** — manage limited berths (memory, compute, connections)
-- **Service discovery** — agents dock at the harbor to discover room capabilities
-- **Load balancing** — distribute agents across multiple harbors
-- **Infrastructure coordination** — the harbor pattern for microservice mesh
-
-## See Also
-
-- **ternary-room** — rooms are what harbors connect to
-- **ternary-anchor** — anchors hold position once docked
-- **ternary-cargo** — cargo is what agents exchange while docked
-- **ternary-dockyard** — dockyards repair agents between voyages
-- **ternary-shipyard** — shipyards build the agents that arrive at harbors
-- **ternary-beacon** — beacons announce harbor locations
-- **ternary-navigator** — navigation guides agents to harbors
-
-## Install
 
 ```bash
 cargo add ternary-harbor
 ```
+
+## API
+
+| Type / Function | Description |
+|---|---|
+| `Dock` | Single berth: `new(id, capacity)`, `status()`, `current_load()` |
+| `BerthStatus` | `Empty`, `Occupied(AgentId)`, `Reserved(AgentId)`, `Maintenance` |
+| `BerthId`, `AgentId` | Newtype identifiers |
+| `Ternary` | Priority: `Negative`, `Neutral`, `Positive` |
+
+## Architecture Notes
+
+Harbors manage agent lifecycle at **SuperInstance** room boundaries. Each room has a harbor that processes incoming agents, assigns them to compute resources, and protects against cascading failures. The γ + η = C conservation manifests in berth utilization: active agents contribute γ (growth), idle agents contribute η (entropy overhead), and the harbor balances the total load against room capacity C. See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+
+## References
+
+- Tanenbaum, Andrew. *Distributed Systems*, 4th ed., 2023 — resource management.
+- Brewer, Eric. "CAP Twelve Years Later," *IEEE Computer*, 45(2), 2012 — fault tolerance.
+- Kleinberg, Jon & Tardos, Éva. *Algorithm Design*, Pearson, 2006 — scheduling algorithms.
 
 ## License
 
