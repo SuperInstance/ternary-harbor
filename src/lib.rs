@@ -148,11 +148,13 @@ impl Dock {
 
     /// Add load to the dock (resources consumed by the docked agent).
     pub fn add_load(&mut self, amount: u32) -> Result<(), &'static str> {
-        if self.current_load + amount > self.capacity {
-            return Err("Would exceed capacity");
+        match self.current_load.checked_add(amount) {
+            Some(total) if total <= self.capacity => {
+                self.current_load = total;
+                Ok(())
+            }
+            _ => Err("Would exceed capacity"),
         }
-        self.current_load += amount;
-        Ok(())
     }
 
     /// Release load from the dock.
@@ -339,13 +341,10 @@ impl HarborMaster {
         if let Some(dock) = harbor.find_empty() {
             let berth_id = dock.id();
             if let Some(dock) = harbor.dock_mut(berth_id) {
-                if req.requested_load <= dock.available_capacity() {
-                    if dock.dock(req.agent).is_ok() {
-                        if dock.add_load(req.requested_load).is_err() {
-                            // Load exceeded capacity; still docked but without full load
-                        }
-                        return PilotResult::Docked(berth_id);
-                    }
+                if req.requested_load <= dock.available_capacity() && dock.dock(req.agent).is_ok() {
+                    // Safe after the capacity check above.
+                    let _ = dock.add_load(req.requested_load);
+                    return PilotResult::Docked(berth_id);
                 }
             }
         }
@@ -372,7 +371,15 @@ impl HarborMaster {
             if let Some(dock) = harbor.find_empty() {
                 let berth_id = dock.id();
                 if let Some(dock) = harbor.dock_mut(berth_id) {
-                    if dock.dock(req.agent).is_ok() {
+                    // Honor the same capacity contract as `request_docking`:
+                    // only dock when the requested load actually fits. A
+                    // request that can never fit any berth stays queued
+                    // rather than being silently docked with a dropped load.
+                    if req.requested_load <= dock.available_capacity()
+                        && dock.dock(req.agent).is_ok()
+                    {
+                        // Safe after the capacity check above: the sum is
+                        // bounded by the dock's capacity.
                         let _ = dock.add_load(req.requested_load);
                         results.push(PilotResult::Docked(berth_id));
                         continue;
@@ -431,36 +438,49 @@ impl Tug {
     }
 
     /// Assist an agent in moving between berths.
+    ///
+    /// The move is atomic with respect to failure: the source berth is only
+    /// vacated once the destination is known to accept the agent, so an agent
+    /// can never be left in a "limbo" state (undocked everywhere) by a failed
+    /// transfer.
     pub fn assist_move(
         &self,
         harbor: &mut Harbor,
         from_berth: BerthId,
         to_berth: BerthId,
     ) -> Result<AgentId, &'static str> {
+        // Read the agent from the source without mutating anything yet.
         let agent = {
             let from = harbor
                 .dock_mut(from_berth)
                 .ok_or("Source berth not found")?;
-            if !from.is_occupied() {
-                return Err("Source berth is not occupied");
-            }
             match from.status() {
                 BerthStatus::Occupied(a) => *a,
                 _ => return Err("Source berth is not occupied"),
             }
         };
 
-        {
-            let from = harbor.dock_mut(from_berth).unwrap();
-            from.undock()?;
-        }
-
+        // Validate the destination up front so the actual dock below cannot
+        // fail and leave the agent homeless.
         {
             let to = harbor
                 .dock_mut(to_berth)
                 .ok_or("Destination berth not found")?;
-            to.dock(agent)?;
+            if !to.is_empty() {
+                return Err("Destination berth is not empty");
+            }
         }
+
+        // All preconditions hold; perform the move.
+        harbor
+            .dock_mut(from_berth)
+            .expect("source verified above")
+            .undock()?;
+        harbor
+            .dock_mut(to_berth)
+            .expect("destination verified above")
+            .dock(agent)
+            .expect("destination verified empty above");
 
         Ok(agent)
     }
@@ -740,9 +760,14 @@ mod tests {
     fn harbor_master_queues_when_full() {
         let mut harbor = Harbor::new("main", 1, 100);
         let mut hm = HarborMaster::new("main");
-        hm.request_docking(&mut harbor, DockingRequest::new(agent(1), Ternary::Neutral, 10));
-        let result =
-            hm.request_docking(&mut harbor, DockingRequest::new(agent(2), Ternary::Neutral, 10));
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(1), Ternary::Neutral, 10),
+        );
+        let result = hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(2), Ternary::Neutral, 10),
+        );
         assert_eq!(result, PilotResult::Queued);
         assert_eq!(hm.queue_length(), 1);
     }
@@ -751,8 +776,14 @@ mod tests {
     fn harbor_master_processes_queue() {
         let mut harbor = Harbor::new("main", 1, 100);
         let mut hm = HarborMaster::new("main");
-        hm.request_docking(&mut harbor, DockingRequest::new(agent(1), Ternary::Neutral, 10));
-        hm.request_docking(&mut harbor, DockingRequest::new(agent(2), Ternary::Neutral, 10));
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(1), Ternary::Neutral, 10),
+        );
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(2), Ternary::Neutral, 10),
+        );
         assert_eq!(hm.queue_length(), 1);
 
         // Free the berth
@@ -765,18 +796,42 @@ mod tests {
 
     #[test]
     fn harbor_master_positive_priority_goes_first() {
+        // Scenario that can only pass if priority ordering is honored:
+        // the neutral request is queued FIRST, then the positive request is
+        // queued SECOND. Under plain FIFO the neutral agent (2) would win the
+        // freed berth; under the documented ternary ordering the positive
+        // agent (3) must win despite being submitted later.
         let mut harbor = Harbor::new("main", 1, 100);
         let mut hm = HarborMaster::new("main");
-        hm.request_docking(&mut harbor, DockingRequest::new(agent(1), Ternary::Neutral, 10));
-        // Queue agent 3 (positive) — should go to front
-        hm.request_docking(&mut harbor, DockingRequest::new(agent(3), Ternary::Positive, 10));
-        // Queue agent 2 (neutral) — should be behind positive
-        hm.request_docking(&mut harbor, DockingRequest::new(agent(2), Ternary::Neutral, 10));
+        // Fill the only berth so subsequent requests are queued.
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(1), Ternary::Neutral, 10),
+        );
+        // Queue the lower-priority agent first.
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(2), Ternary::Neutral, 10),
+        );
+        // Queue the higher-priority agent second.
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(3), Ternary::Positive, 10),
+        );
+        assert_eq!(hm.queue_length(), 2);
 
+        // Free the berth, then process the queue.
         harbor.dock_mut(BerthId(0)).unwrap().undock().unwrap();
         let results = hm.process_queue(&mut harbor);
-        // First processed should be agent 3 (positive priority)
-        assert!(matches!(results[0], PilotResult::Docked(_)));
+
+        // Exactly one agent should have been docked.
+        assert_eq!(results.len(), 1);
+        assert_eq!(hm.queue_length(), 1);
+        // The positive-priority agent (3) must be the one now occupying the berth.
+        assert_eq!(
+            harbor.dock_mut(BerthId(0)).unwrap().status(),
+            &BerthStatus::Occupied(agent(3))
+        );
     }
 
     // -- Tug tests --
@@ -863,5 +918,180 @@ mod tests {
         let mut bw = Breakwater::new(3);
         bw.register(agent(1)).unwrap();
         assert!(bw.register(agent(1)).is_err());
+    }
+
+    // -- Additional error-path / invariant coverage --
+
+    #[test]
+    fn dock_reserve_fails_when_occupied() {
+        let mut d = Dock::new(berth(0), 100);
+        d.dock(agent(1)).unwrap();
+        assert!(d.reserve(agent(2)).is_err());
+    }
+
+    #[test]
+    fn dock_reserve_fails_in_maintenance() {
+        let mut d = Dock::new(berth(0), 100);
+        d.start_maintenance().unwrap();
+        assert!(d.reserve(agent(1)).is_err());
+    }
+
+    #[test]
+    fn dock_end_maintenance_when_not_in_maintenance_fails() {
+        let mut d = Dock::new(berth(0), 100);
+        assert!(d.end_maintenance().is_err());
+        d.dock(agent(1)).unwrap();
+        assert!(d.end_maintenance().is_err());
+    }
+
+    #[test]
+    fn dock_add_load_exact_capacity_boundary() {
+        let mut d = Dock::new(berth(0), 100);
+        d.dock(agent(1)).unwrap();
+        // Exactly at capacity is allowed.
+        assert!(d.add_load(100).is_ok());
+        assert_eq!(d.current_load(), 100);
+        assert_eq!(d.available_capacity(), 0);
+        // One more must fail.
+        assert!(d.add_load(1).is_err());
+    }
+
+    #[test]
+    fn dock_add_load_overflow_does_not_panic() {
+        // A huge amount must not panic (overflow) and must be rejected.
+        let mut d = Dock::new(berth(0), 100);
+        d.dock(agent(1)).unwrap();
+        d.add_load(1).unwrap();
+        assert!(d.add_load(u32::MAX).is_err());
+        assert_eq!(d.current_load(), 1);
+    }
+
+    #[test]
+    fn dock_release_load_saturates() {
+        let mut d = Dock::new(berth(0), 100);
+        d.dock(agent(1)).unwrap();
+        d.add_load(10).unwrap();
+        // Releasing more than present saturates at zero rather than underflowing.
+        d.release_load(1000);
+        assert_eq!(d.current_load(), 0);
+    }
+
+    #[test]
+    fn tug_transfer_insufficient_destination_no_partial_mutation() {
+        let t = Tug::new(1);
+        let mut from = Dock::new(berth(0), 100);
+        let mut to = Dock::new(berth(1), 30); // small destination
+        from.dock(agent(1)).unwrap();
+        from.add_load(50).unwrap();
+        to.dock(agent(2)).unwrap();
+
+        // Transfer 40 into a destination with only 30 free must fail...
+        assert!(t.transfer_load(&mut from, &mut to, 40).is_err());
+        // ...and must leave BOTH docks untouched (no partial transfer).
+        assert_eq!(from.current_load(), 50);
+        assert_eq!(to.current_load(), 0);
+    }
+
+    #[test]
+    fn tug_assist_move_destination_occupied_is_atomic() {
+        // Atomicity invariant: if the destination cannot accept the agent,
+        // the source must keep its agent. Previously the agent was undocked
+        // from the source and then lost when the destination dock failed.
+        let t = Tug::new(1);
+        let mut h = Harbor::new("main", 2, 100);
+        h.dock_mut(berth(0)).unwrap().dock(agent(1)).unwrap();
+        // Destination is also occupied.
+        h.dock_mut(berth(1)).unwrap().dock(agent(2)).unwrap();
+
+        let err = t.assist_move(&mut h, berth(0), berth(1)).unwrap_err();
+        assert!(err.contains("Destination berth is not empty"));
+        // Source must still hold agent 1.
+        assert_eq!(
+            h.dock_mut(berth(0)).unwrap().status(),
+            &BerthStatus::Occupied(agent(1))
+        );
+        // Destination still holds agent 2.
+        assert_eq!(
+            h.dock_mut(berth(1)).unwrap().status(),
+            &BerthStatus::Occupied(agent(2))
+        );
+    }
+
+    #[test]
+    fn tug_assist_move_missing_berths_error() {
+        let t = Tug::new(1);
+        let mut h = Harbor::new("main", 1, 100);
+        h.dock_mut(berth(0)).unwrap().dock(agent(1)).unwrap();
+        // Destination does not exist.
+        assert!(t.assist_move(&mut h, berth(0), berth(99)).is_err());
+        // Source not occupied.
+        let mut h2 = Harbor::new("main", 2, 100);
+        assert!(t.assist_move(&mut h2, berth(0), berth(1)).is_err());
+    }
+
+    #[test]
+    fn harbor_master_request_with_oversized_load_is_queued() {
+        // A request whose load exceeds every berth's capacity cannot dock
+        // immediately and must be queued (not silently docked with 0 load).
+        let mut harbor = Harbor::new("main", 1, 100);
+        let mut hm = HarborMaster::new("main");
+        let result = hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(1), Ternary::Neutral, 200),
+        );
+        assert_eq!(result, PilotResult::Queued);
+        // Berth stays empty.
+        assert!(harbor.dock_mut(berth(0)).unwrap().is_empty());
+        assert_eq!(hm.queue_length(), 1);
+    }
+
+    #[test]
+    fn harbor_master_process_queue_will_not_dock_oversized_load() {
+        // process_queue must honor the same capacity contract as
+        // request_docking: an oversized request stays queued rather than
+        // being docked with a silently-dropped load.
+        let mut harbor = Harbor::new("main", 1, 100);
+        let mut hm = HarborMaster::new("main");
+        hm.request_docking(
+            &mut harbor,
+            DockingRequest::new(agent(1), Ternary::Neutral, 200),
+        );
+        assert_eq!(hm.queue_length(), 1);
+
+        let results = hm.process_queue(&mut harbor);
+        // Nothing docked...
+        assert!(results.is_empty());
+        // ...berth still empty...
+        assert!(harbor.dock_mut(berth(0)).unwrap().is_empty());
+        // ...and the request remains in the queue.
+        assert_eq!(hm.queue_length(), 1);
+    }
+
+    #[test]
+    fn pilot_guide_out_missing_berth_errors() {
+        let mut h = Harbor::new("main", 1, 100);
+        let p = Pilot::new("main");
+        assert!(p.guide_out(&mut h, berth(99)).is_err());
+    }
+
+    #[test]
+    fn harbor_dock_mut_missing_returns_none() {
+        let mut h = Harbor::new("main", 2, 100);
+        assert!(h.dock_mut(berth(99)).is_none());
+    }
+
+    #[test]
+    fn breakwater_shelters_only_registered_docked_agents() {
+        // Invariant: sheltered = registered AND docked (up to capacity,
+        // which registration already guarantees). Everyone else is evicted.
+        let mut bw = Breakwater::new(5);
+        bw.register(agent(1)).unwrap();
+        bw.register(agent(3)).unwrap(); // registered but NOT docked
+
+        let report = bw.signal_storm(&[agent(1), agent(2), agent(4)]);
+        // Only agent 1 is both registered and docked.
+        assert_eq!(report.sheltered, vec![agent(1)]);
+        // Agents 2 and 4 are docked but not registered -> evicted.
+        assert_eq!(report.evicted, vec![agent(2), agent(4)]);
     }
 }
